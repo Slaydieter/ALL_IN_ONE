@@ -1,0 +1,21 @@
+{
+  "pc_id": "PC2",
+  "host": "0.0.0.0",
+  "port": 6100,
+  "token": "IS1200_480_CHANGE_ME",
+  "startup_delay_sec": 20,
+  "apps": {
+    "inspection": {
+      "label": "IS1200_480 PC2",
+      "cmd": [
+        "C:\\DUONG_DAN_PYTHON\\pythonw.exe",
+        "D:\\IS1200_480\\IS1200_480_L1_PC2_PM.py"
+      ],
+      "cwd": "D:\\IS1200_480",
+      "abort_port": 6101,
+      "autostart": false,
+      "hide_console": true,
+      "discard_output": true
+    }
+  }
+}

@@ -1,0 +1,8 @@
+{
+  "pc_id": "PC2",
+  "token": "480_C3",
+  "PC1_host": "10.255.129.160",
+  "PC2_host": "10.255.129.3",
+  "PC3_host": "10.255.128.202",
+  "note": "REQUIRED: verify ALL three IPs + token on each PC before deployment"
+}

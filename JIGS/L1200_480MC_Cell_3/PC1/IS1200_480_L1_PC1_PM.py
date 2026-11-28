@@ -216,6 +216,7 @@ class Cycle:
     verdict: str = ''
     check_no: int = 0
     ack_final: bool = False
+    worker_boots: dict = field(default_factory=dict)
 
 
 class CycleMachine:
@@ -319,7 +320,10 @@ class Bridge:
         self.peer_boots = {}
         self.ready = True
         self.last_seen = {}
-        self.last_fault = ''
+        self.workers_ready = threading.Event()
+        self.mode_lock = threading.Lock()
+        self.mode_state_lock = threading.Lock()
+        self.pending_aborts = set()
         self._last_started = set()
         self._latency_timeout = 150.0
         self._repeat_lock = threading.Lock()
@@ -333,7 +337,6 @@ class Bridge:
         self._pending_local_final = None
         if pc_id == 'PC1':
             threading.Thread(target=serve_loop, args=('0.0.0.0', EVENT_PORT, self._on_event, 'master events'), daemon=True).start()
-            threading.Thread(target=self._watchdog, daemon=True).start()
         else:
             threading.Thread(target=serve_loop, args=('0.0.0.0', CTRL_PORT, self._on_command, 'worker commands'), daemon=True).start()
             threading.Thread(target=serve_loop, args=('127.0.0.1', ABORT_PORT, self._on_abort, 'abort listener'), daemon=True).start()
@@ -481,14 +484,16 @@ class Bridge:
         self.last_seen[pc] = time.monotonic()
         old_boot = self.peer_boots.get(pc)
         if old_boot is not None and old_boot != boot:
-            self.fault(f'{pc} Windows restarted (boot changed)', allow_idle=True)
-            self.app.ui_queue.put({'type':'is480_remote_reboot','pc':pc})
-        self.peer_boots[pc] = boot
+            self.workers_ready.clear()
+            self.fault(f'{pc} Windows rebooted', transient=True)
+            return {'ok': False, 'error': 'worker boot changed; waiting for STATUS'}
         evt = msg.get('event')
         if evt == 'HEARTBEAT':
-            cams=msg.get('camera_faults') or []
+            cams = msg.get('camera_faults') or []
             if cams:
-                self.fault(f'{pc} CAMERA DISCONNECTED: {cams}',allow_idle=True)
+                self.workers_ready.clear()
+                self.warning(f'{pc}:camera', f'{pc} mất camera: {cams}')
+                self.fault(f'{pc} mất camera: {cams}', transient=True)
             return {'ok': True}
         cid = str(msg.get('cycle_id') or '')
         if evt == 'FAULT':
@@ -524,25 +529,47 @@ class Bridge:
                                    'cam_vt':msg.get('cam_vt'),'kind':msg.get('kind'), 'path':saved})
         return {'ok': True}
 
-    def probe_peers(self):
-        boots = {}
-        for pc in ('PC2','PC3'):
-            res = self._request(pc, 'STATUS')
-            if not res.get('ok') or res.get('pc') != pc:
-                raise ConnectionError(f'{pc} unavailable: {res}')
-            if res.get('camera_faults'):
-                raise RuntimeError(f'{pc} camera lost: {res["camera_faults"]}')
-            boots[pc] = res['boot']
+    def warning(self, source, message=None):
+        self.app.ui_queue.put({'type': 'is480_warning', 'source': source, 'message': message})
+
+    def poll_workers(self):
+        statuses = {}
+        for pc in ('PC2', 'PC3'):
+            try:
+                status = self._request(pc, 'STATUS')
+                if (not status.get('ok') or status.get('pc') != pc
+                        or status.get('boot') is None or status.get('mode') not in ('PM', 'RUN')
+                        or not isinstance(status.get('camera_faults'), list)):
+                    raise ConnectionError('STATUS không hợp lệ')
+            except Exception as exc:
+                reason = f'Mất kết nối {pc}: {exc}'
+                self.workers_ready.clear()
+                self.warning(f'{pc}:connection', reason)
+                self.fault(reason, transient=True)
+                continue
             self.last_seen[pc] = time.monotonic()
-            old = self.peer_boots.get(pc)
-            if old is not None and old != res['boot']:
-                self.fault(f'{pc} Windows rebooted', allow_idle=True)
-            self.peer_boots[pc] = res['boot']
-        return boots
+            self.warning(f'{pc}:connection')
+            if status['camera_faults']:
+                reason = f"{pc} mất camera: {status['camera_faults']}"
+                self.workers_ready.clear()
+                self.warning(f'{pc}:camera', reason)
+                self.fault(reason, transient=True)
+            else:
+                self.warning(f'{pc}:camera')
+            statuses[pc] = status
+        return statuses
 
     def begin_master(self, barcode, mode):
-        self.probe_peers()
+        if not self.workers_ready.is_set():
+            raise ConnectionError('Hai máy phụ chưa sẵn sàng')
+        statuses = self.poll_workers()
+        if (len(statuses) != 2 or any(
+                st['camera_faults'] or st['mode'] != mode
+                or st['boot'] != self.peer_boots.get(pc) for pc, st in statuses.items())):
+            self.workers_ready.clear()
+            raise ConnectionError('Trạng thái máy phụ đã thay đổi; chờ đồng bộ lại')
         cid = self.machine.start(barcode, mode)
+        self.machine.cycle.worker_boots = dict(self.peer_boots)
         for pc in ('PC2', 'PC3'):
             res = self._request(pc, 'CAPTURE_VT1', cycle_id=cid, barcode=barcode, mode=mode)
             if not res.get('ok') or res.get('cycle_id') != cid:
@@ -732,11 +759,17 @@ class Bridge:
                 gate = getattr(self.app, 'is480_rfid_gate_active', None)
                 if gate is not None:
                     gate.set()
-            for pc in ('PC2','PC3'):
+            for pc in ('PC2', 'PC3'):
                 try:
-                    self._request(pc,'ACK_FINAL',cycle_id=c.cid)
+                    if not self._request(pc, 'ACK_FINAL', cycle_id=c.cid).get('ok'):
+                        raise RuntimeError('máy phụ từ chối ACK_FINAL')
                 except Exception as exc:
-                    self.app.ui_queue.put({'type':'is480_warning', 'message':f'{pc}: ACK_FINAL network issue: {exc}'})
+                    self.workers_ready.clear()
+                    with self.mode_lock:
+                        # PLC has finalized this Body. Discard a stale worker
+                        # cycle before admitting another Body.
+                        self.pending_aborts.add(pc)
+                        self.warning(f'{pc}:abort', f'{pc} chưa chốt chu trình qua TCP: {exc}')
             self.app.ui_queue.put({'type':'is480_commit', 'cycle_id':c.cid, 'verdict':c.verdict,
                                    'barcode':c.barcode,'check_no':c.check_no, 'mode':c.mode})
             with self._repeat_lock:
@@ -748,19 +781,23 @@ class Bridge:
             return True
         return False
 
-    def fault(self, reason, cid=None, allow_idle=False):
+    def fault(self, reason, cid=None, transient=False):
         changed = self.machine.fail(reason, cid)
-        # A failure while START_CYCLE is being negotiated has no active cycle
-        # yet; it still MUST reach PC1 WARNING banner.
-        if changed or ((allow_idle or self.machine.cycle is None) and str(reason)!=self.last_fault):
-            self.last_fault = str(reason)
-            self.app.ui_queue.put({'type':'is480_warning','message':self.last_fault})
+        if changed:
+            self.workers_ready.clear()
+            self.warning('cycle', f'{reason} — dùng DỪNG CHECK để hủy Body đang lỗi')
+        elif not transient and self.machine.cycle is None:
+            self.warning('operation', str(reason))
         if changed and self.pc_id == 'PC1':
+            failed_cid = self.machine.cycle.cid
+
             def abort_peers():
-                for pc in ('PC2','PC3'):
-                    try:self._request(pc,'ABORT')
-                    except Exception:pass
-            threading.Thread(target=abort_peers,daemon=True).start()
+                with self.mode_lock:
+                    cycle = self.machine.cycle
+                    if cycle.cid == failed_cid and cycle.state == 'FAULT':
+                        self.pending_aborts.update(self.peers)
+                        self.retry_peer_aborts(self.peers)
+            threading.Thread(target=abort_peers, daemon=True).start()
         if changed and self.pc_id != 'PC1':
             try:
                 self._out_event('FAULT', cycle_id=cid or self.machine.cycle.cid, reason=reason)
@@ -769,55 +806,47 @@ class Bridge:
         return changed
 
     def _watchdog(self):
-        while True:
+        while self.app.camera_running:
             time.sleep(1)
-            if time.monotonic()-self._last_health_poll>5:
-                self._last_health_poll=time.monotonic()
-                for pc in ('PC2','PC3'):
-                    try:
-                        response=self._request(pc,'STATUS')
-                        if not response.get('ok'):
-                            raise ConnectionError(response)
-                        old=self.peer_boots.get(pc)
-                        if old is not None and old!=response.get('boot'):
-                            self.fault(f'{pc} Windows rebooted',allow_idle=True)
-                            self.app.ui_queue.put({'type':'is480_remote_reboot','pc':pc})
-                        self.peer_boots[pc]=response.get('boot')
-                        self.last_seen[pc]=time.monotonic()
-                        cams=response.get('camera_faults') or []
-                        if cams:self.fault(f'{pc} disconnected cameras: {cams}',allow_idle=True)
-                    except Exception as exc:
-                        self.fault(f'{pc} unavailable: {exc}',allow_idle=True)
+            if time.monotonic() - self._last_health_poll > 5:
+                self._last_health_poll = time.monotonic()
+                self.app._is480_sync_workers()
             c = self.machine.cycle
-            if not c or c.state in ('FAULT','DONE','ABORTED'):
+            if not c or c.state in ('FAULT', 'DONE', 'ABORTED'):
                 continue
             if time.monotonic() - c.created > self._latency_timeout:
                 self.fault(f'Cycle timeout {c.cid}: state={c.state}', cid=c.cid)
                 continue
-            for pc in ('PC2','PC3'):
+            for pc in ('PC2', 'PC3'):
                 t = self.last_seen.get(pc, 0)
                 if t and time.monotonic() - t > 14:
                     self.fault(f'{pc} heartbeat lost', cid=c.cid)
                     break
 
+    def retry_peer_aborts(self, online):
+        for pc in sorted(self.pending_aborts.intersection(online)):
+            try:
+                if not self._request(pc, 'ABORT').get('ok'):
+                    raise RuntimeError('máy phụ từ chối ABORT')
+            except Exception as exc:
+                self.warning(f'{pc}:abort', f'{pc} chưa xác nhận hủy chu trình: {exc}')
+            else:
+                self.pending_aborts.remove(pc)
+                self.warning(f'{pc}:abort')
+
     def abort(self):
-        # Synchronize with an in-flight Serial write; software-only ABORT
-        # does not write any byte itself. Prevent pending retransmit races.
-        if self.pc_id == 'PC1':
+        # Serialize cancellation with mode changes and admission of a new cycle.
+        with self.mode_lock:
+            self.workers_ready.clear()
             with self.app.serial_lock:
                 self.machine.abort()
-                for event in list(self._repeat_stop.values()):event.set()
-        else:
-            self.machine.abort()
-            for event in list(self._repeat_stop.values()):event.set()
-        self._pending_local_final = None
-        if self.pc_id == 'PC1':
-            for pc in ('PC2','PC3'):
-                try:
-                    self._request(pc,'ABORT')
-                except Exception as exc:
-                    self.app.ui_queue.put({'type':'is480_warning','message':f'{pc} abort unavailable: {exc}'})
-        self.app.ui_queue.put({'type':'is480_abort'})
+                for event in list(self._repeat_stop.values()):
+                    event.set()
+            self._pending_local_final = None
+            self.warning('cycle')
+            self.app.ui_queue.put({'type': 'is480_abort'})
+            self.pending_aborts.update(self.peers)
+            self.retry_peer_aborts(self.peers)
 
 
 def load_site_config(path, pc_id):
@@ -4379,6 +4408,7 @@ class Main_Application(tk.Tk):
                 return
             self.databacode = barcode
             self.current_barcode = barcode
+            self.is480_bridge.warning('barcode')
             self.ui_queue.put({'type': 'hienthibarcode', 'barcode': barcode})
             self.gui_kqdocbarcode = True
             # Keep legacy 0x31 repeat until PLC enters VT1 (0x11).
@@ -4389,12 +4419,12 @@ class Main_Application(tk.Tk):
         finally:
             # Important for errors, timeouts and successful scans alike.
             try:
-                if not scanner.send('scan_disable'):
-                    self.ui_queue.put({'type':'is480_warning',
-                        'message':'Không gửi được scan_disable COM3; kiểm tra đầu đọc'})
+                if scanner.send('scan_disable'):
+                    self.is480_bridge.warning('barcode_disable')
+                else:
+                    self.is480_bridge.warning('barcode_disable', 'Không gửi được scan_disable COM3')
             except Exception as exc:
-                self.ui_queue.put({'type':'is480_warning',
-                    'message':f'COM3 scan_disable lỗi: {exc}'})
+                self.is480_bridge.warning('barcode_disable', f'COM3 scan_disable lỗi: {exc}')
 
     def check_barcode(self):
         """Exclusive production COM3 reading; never started by repair scanner."""
@@ -4415,8 +4445,7 @@ class Main_Application(tk.Tk):
         self.databacode = None
         self.current_barcode = None
         self.gui_kqdocbarcode = False
-        self.ui_queue.put({'type': 'is480_warning',
-                           'message': 'Không đọc được barcode thật từ COM3; chờ xử lý'})
+        self.is480_bridge.warning('barcode', 'Không đọc được barcode thật từ COM3; chờ xử lý')
 
     def send_direct_all(self, message):
         for ip, port in self.client_list:
@@ -4478,7 +4507,7 @@ class Main_Application(tk.Tk):
         self.is480_view_lock = threading.RLock()
         self.is480_checked_jpegs = {}  # latest cycle; JPEG thumbnails only
         self.is480_remote_view_jpegs = {}  # PC1: {(pc,CAM_VT): JPEG}
-        self.is480_warning = None
+        self.is480_warnings = {}
         self.is480_remote_ng_paths = {} # {(pc,CAM_VT): PROC JPG path}
         self.is480_remote_view_verdict = {} # PM and RUN camera flags
         self.is480_remote_details_lock = threading.RLock()
@@ -4559,9 +4588,9 @@ class Main_Application(tk.Tk):
             scanner = getattr(self, 'initProcess', None)
             if scanner is not None and not scanner.send('scan_disable'):
                 _log(self, 'SCANNER_IDLE', 'Chưa gửi được scan_disable COM3; kiểm tra kết nối')
-            # mode recovery checks all three Windows boots before authorizing RUN
-            if self.is480_mode_state.get('mode') == 'RUN':
-                threading.Thread(target=self._is480_recover_mode, daemon=True).start()
+            if self.is480_mode_state.get('pm_required'):
+                self._is480_warning('Máy phụ đã reboot Windows — cần chạy PM lại', 'pm_required')
+            threading.Thread(target=self.is480_bridge._watchdog, daemon=True).start()
         else:
             self.after(750, self._is480_ready_event)
 
@@ -4662,13 +4691,7 @@ class Main_Application(tk.Tk):
             self.is480_warning_bar = tk.Label(
                 self, text='', bg='#FFD166', fg='#6B2100',
                 font=('Arial',12,'bold'), anchor='w', padx=10)
-        if self.is480_warning:
-            self.is480_warning_bar.config(text='⚠ WARNING / HOLD — '+self.is480_warning)
-            self.rowconfigure(0, minsize=34)
-            self.is480_warning_bar.grid(row=0, column=0, sticky='ew')
-        else:
-            self.is480_warning_bar.grid_remove()
-            self.rowconfigure(0, minsize=0)
+        self._is480_render_warnings()
 
     def _is480_sync_run_button(self):
         if getattr(self,'is480_pc_id',None)=='PC1' and hasattr(self,'is480_run_btn'):
@@ -4986,17 +5009,31 @@ class Main_Application(tk.Tk):
         if self.is480_pc_id == 'PC1':
             self._is480_repair_notice('Đầu đọc sửa HID/COM riêng sẵn sàng',ok=True)
 
-    def _is480_warning(self,msg):
-        self.is480_warning=str(msg)
-        _log(self,'WARNING',self.is480_warning)
-        if getattr(self,'is480_pc_id',None)=='PC1':
-            if hasattr(self,'is480_warning_bar') and self.is480_warning_bar.winfo_exists():
-                self.is480_warning_bar.config(text='⚠ WARNING / HOLD — '+self.is480_warning)
-                self.rowconfigure(0, minsize=34)
-                self.is480_warning_bar.grid(row=0, column=0, sticky='ew')
+    def _is480_render_warnings(self):
+        bar = getattr(self, 'is480_warning_bar', None)
+        if bar is None or not bar.winfo_exists():
+            return
+        if self.is480_warnings:
+            bar.config(text='⚠ WARNING / HOLD — ' + ' | '.join(self.is480_warnings.values()),
+                       wraplength=max(600, self.winfo_width() - 25))
+            self.rowconfigure(0, minsize=34)
+            bar.grid(row=0, column=0, sticky='ew')
         else:
-            # worker displays local warning on result window
-            self.widget_result_check.label2.config(text='FAULT',bg='#F7C948')
+            bar.grid_remove()
+            self.rowconfigure(0, minsize=0)
+
+    def _is480_warning(self, message, source='operation'):
+        if message is None:
+            if source not in self.is480_warnings:
+                return
+            del self.is480_warnings[source]
+        else:
+            message = str(message)
+            if self.is480_warnings.get(source) == message:
+                return
+            self.is480_warnings[source] = message
+            _log(self, 'WARNING', message)
+        self._is480_render_warnings()
 
     def _is480_fault(self,reason):
         bridge=getattr(self,'is480_bridge',None)
@@ -5460,64 +5497,99 @@ class Main_Application(tk.Tk):
     def _is480_request_run(self,bypass=False):
         if self.is480_pc_id!='PC1':return
         if not bypass and not self.is480_mode_state.get('pm_attempted'):
-            self._is480_warning('Chưa chạy PM; không thể chuyển RUN')
+            self._is480_warning('Chưa chạy PM; không thể chuyển RUN', 'run_request')
             return
         c=self.is480_bridge.machine.cycle
         if c and c.state not in ('DONE','ABORTED'):
-            self._is480_warning('Phải kết thúc/hủy chu trình trước khi chuyển RUN')
+            self._is480_warning('Phải kết thúc/hủy chu trình trước khi chuyển RUN', 'run_request')
             return
         threading.Thread(target=self._is480_run_worker,args=(bypass,),daemon=True).start()
 
-    def _is480_run_worker(self,bypass=False):
-        try:
-            boots=self.is480_bridge.probe_peers()
-            old=self.is480_mode_state.get('peers',{})
-            if old and any(old.get(pc)!=boots[pc] for pc in ('PC2','PC3')) and not bypass:
-                self.is480_mode_state.update({'pm_attempted':False,'mode':'PM','peers':boots})
-                _save_mode(self,self.is480_mode_state)
-                raise RuntimeError('Có PC đã reboot Windows: bắt buộc PM lại')
-            for pc in ('PC2','PC3'):
-                res=self.is480_bridge._request(pc,'SET_MODE_RUN')
-                if not res.get('ok'):raise RuntimeError(f'{pc} RUN rejected: {res}')
-            self.is480_mode_state.update({'mode':'RUN','pm_attempted':bool(self.is480_mode_state.get('pm_attempted')),'peers':boots,'boot':boot_marker(),
-                                          'bypass':bool(bypass)})
-            _save_mode(self,self.is480_mode_state)
-            self.ui_queue.put({'type':'is480_mode_run'})
-            _log(self,'PM_BYPASS_RUN' if bypass else 'MODE_RUN','both clients confirmed')
-        except Exception as exc:
-            self.ui_queue.put({'type':'is480_warning','message':f'Không thể chuyển RUN đồng bộ: {exc}'})
+    def _is480_run_worker(self, bypass=False):
+        self._is480_sync_workers(request_run=True, bypass=bypass)
 
-    def _is480_resync_pm(self):
-        '''A reboot of ANY machine invalidates PM and RUN for all three PCs.'''
-        failures=[]
-        for pc in ('PC2','PC3'):
+    def _is480_sync_workers(self, request_run=False, bypass=False):
+        bridge = self.is480_bridge
+        with bridge.mode_lock:
             try:
-                result=self.is480_bridge._request(pc,'SET_MODE_PM')
-                if not result.get('ok'):
-                    failures.append(f'{pc}: {result}')
+                self._is480_check_workers(request_run, bypass)
             except Exception as exc:
-                failures.append(f'{pc}: {exc}')
-        if failures:
-            self.ui_queue.put({'type':'is480_warning',
-                               'message':'Chưa đồng bộ PM sau reboot: '+ '; '.join(failures)})
+                bridge.workers_ready.clear()
+                bridge.warning('mode', f'Chưa đồng bộ PM/RUN: {exc}')
 
-    def _is480_recover_mode(self):
-        try:
-            boots=self.is480_bridge.probe_peers()
-            saved=self.is480_mode_state.get('peers',{})
-            if not saved or any(saved.get(pc)!=boots[pc] for pc in ('PC2','PC3')):
-                self.is480_mode_state.update({'mode':'PM','pm_attempted':False,'peers':boots})
-                _save_mode(self,self.is480_mode_state)
-                for pc in ('PC2','PC3'):
-                    self.is480_bridge._request(pc,'SET_MODE_PM')
-                self.ui_queue.put({'type':'is480_warning','message':'Một PC reboot: phải PM lại'})
+    def _is480_check_workers(self, request_run, bypass):
+        bridge = self.is480_bridge
+        statuses = bridge.poll_workers()
+        with bridge.mode_state_lock:
+            state = self.is480_mode_state
+            boots = {pc: status['boot'] for pc, status in statuses.items()}
+            saved_boots = state.get('peers', {})
+            rebooted = any(
+                (pc in bridge.peer_boots and bridge.peer_boots[pc] != boot)
+                or (pc in saved_boots and saved_boots[pc] != boot)
+                or (state.get('mode') == 'RUN' and pc not in saved_boots)
+                for pc, boot in boots.items()
+            )
+            if rebooted:
+                bridge.workers_ready.clear()
+                bridge.fault('Máy phụ đã reboot Windows', transient=True)
+                updated = {**state, 'mode': 'PM', 'pm_attempted': False, 'pm_required': True,
+                           'peers': {**saved_boots, **boots}}
+                _save_mode(self, updated)
+                state.update(updated)
+                bridge.warning('pm_required', 'Máy phụ đã reboot Windows — cần chạy PM lại')
+            bridge.peer_boots.update(boots)
+        bridge.retry_peer_aborts(statuses)
+
+        online = len(statuses) == 2 and not any(st['camera_faults'] for st in statuses.values())
+        if not online or bridge.pending_aborts or bridge.camera_faults():
+            bridge.workers_ready.clear()
+            if request_run:
+                bridge.warning('mode', 'Chưa thể chuyển RUN: hệ thống chưa sẵn sàng')
+            return
+
+        if state.get('pm_required'):
+            request_run = False
+        desired = 'RUN' if request_run else state.get('mode', 'PM')
+        local_mode = 'PM' if self.PM else 'RUN'
+        mismatch = [pc for pc, status in statuses.items() if status['mode'] != desired]
+        cycle = bridge.machine.cycle
+        if cycle and cycle.state not in ('DONE', 'ABORTED'):
+            if any(st['mode'] != cycle.mode for st in statuses.values()):
+                bridge.fault('Máy phụ lệch chế độ trong khi đang kiểm tra', transient=True)
+            if cycle.state == 'FAULT':
+                bridge.workers_ready.clear()
+            return
+
+        if request_run and not (bypass or state.get('pm_attempted')):
+            bridge.warning('run_request', 'Chưa chạy PM; không thể chuyển RUN')
+            return
+        if mismatch or local_mode != desired or request_run:
+            bridge.workers_ready.clear()
+            if self.is480_rfid_gate_active.is_set() or self.is480_body_scan_active.is_set():
+                bridge.warning('mode', f'Đang chờ kết thúc đọc barcode/xác nhận RFID để đồng bộ {desired}')
                 return
-            for pc in ('PC2','PC3'):
-                res=self.is480_bridge._request(pc,'SET_MODE_RUN')
-                if not res.get('ok'):raise RuntimeError(f'{pc}: {res}')
-            self.ui_queue.put({'type':'is480_mode_run'})
-        except Exception as exc:
-            self.ui_queue.put({'type':'is480_warning','message':f'Khôi phục RUN chưa thành công: {exc}'})
+            for pc in mismatch:
+                ack = bridge._request(pc, 'SET_MODE_' + desired)
+                if not ack.get('ok') or ack.get('pc') != pc or ack.get('boot') != boots[pc]:
+                    raise RuntimeError(f'{pc} chưa xác nhận {desired}: {ack}')
+            # Persist authorized RUN only after both workers confirm the mode.
+            if request_run:
+                with bridge.mode_state_lock:
+                    updated = {**state, 'mode': 'RUN', 'peers': boots, 'boot': boot_marker(),
+                               'bypass': bool(bypass)}
+                    _save_mode(self, updated)
+                    state.update(updated)
+            if local_mode != desired:
+                applied = threading.Event()
+                self.ui_queue.put({'type': f'is480_mode_{desired.lower()}', 'applied': applied})
+                if not applied.wait(5):
+                    raise TimeoutError(f'PC1 chưa xác nhận giao diện {desired}')
+        if request_run:
+            bridge.warning('run_request')
+        bridge.warning('mode')
+        bridge.warning('start_cycle')
+        bridge.workers_ready.set()
 
     def _is480_key5(self,event):
         if self.is480_pc_id != 'PC1' or not self.PM:
@@ -5555,20 +5627,20 @@ class Main_Application(tk.Tk):
             self.is480_last_5=[]
 
     def _is480_camera_health(self):
-        if self.is480_pc_id!='PC1':return
-        now=time.monotonic()
-        bridge=self.is480_bridge
+        now = time.monotonic()
+        bridge = self.is480_bridge
         for index in range(8):
-            bad=getattr(self,f'cap{index}',None) is None
-            if bad:
-                since=self.is480_camera_bad_since.setdefault(index,now)
-                if now-since>8:
-                    if bridge.machine.cycle and bridge.machine.cycle.state not in ('DONE','ABORTED'):
-                        bridge.fault(f'PC1 CAM{index} disconnected')
-                    elif not self.is480_warning:
-                        self._is480_warning(f'PC1 CAM{index} disconnected')
-            else:self.is480_camera_bad_since.pop(index,None)
-        self.after(2500,self._is480_camera_health)
+            source = f'PC1:camera:{index}'
+            if getattr(self, f'cap{index}', None) is None:
+                since = self.is480_camera_bad_since.setdefault(index, now)
+                if now - since > 8:
+                    reason = f'PC1 mất kết nối CAM{index}'
+                    self._is480_warning(reason, source)
+                    bridge.fault(reason, transient=True)
+            else:
+                self.is480_camera_bad_since.pop(index, None)
+                self._is480_warning(None, source)
+        self.after(2500, self._is480_camera_health)
 
     def _is480_ready_event(self):
         # Direct UDP heartbeat is independent from PC1 inspection program/network bridge.
@@ -5605,15 +5677,11 @@ class Main_Application(tk.Tk):
             self.show_pm()
             if event.get('applied'):event['applied'].set()
             if self.is480_pc_id=='PC1':self._is480_sync_run_button()
-        elif typ=='is480_remote_reboot':
-            if self.is480_pc_id=='PC1':
-                self.is480_mode_state.update({'mode':'PM','pm_attempted':False})
-                _save_mode(self,self.is480_mode_state)
-                self.show_pm()
-                self._is480_sync_run_button()
-                threading.Thread(target=self._is480_resync_pm,daemon=True).start()
-        elif typ=='is480_warning':self._is480_warning(event.get('message','unknown fault'))
-        elif typ=='is480_abort':self._is480_reset_ui()
+        elif typ == 'is480_warning':
+            self._is480_warning(event.get('message'), event.get('source', 'operation'))
+        elif typ == 'is480_abort':
+            self._is480_reset_ui()
+            self._is480_warning(None, 'run_request')
         elif typ=='is480_commit':
             c=bridge.machine.cycle
             if c and c.cid==event['cycle_id'] and c.ack_final:
@@ -5646,11 +5714,20 @@ class Main_Application(tk.Tk):
                             self.is480_rfid_gate_active.clear()
                     except Exception as exc:
                         # Fail closed: never clear gate if the DB cannot commit.
-                        self._is480_warning('DB COMMIT / WAIT CARD ERROR: '+str(exc))
+                        self._is480_warning('DB COMMIT / WAIT CARD ERROR: ' + str(exc), 'db')
                 elif event['mode']=='PM' and c.mode=='PM':
-                    self.is480_mode_state['pm_attempted']=True
-                    self.is480_mode_state['peers']=dict(bridge.peer_boots)
-                    _save_mode(self,self.is480_mode_state)
+                    with bridge.mode_state_lock:
+                        if c.worker_boots != bridge.peer_boots:
+                            self._is480_warning('Máy phụ đã reboot Windows — cần chạy PM lại', 'pm_required')
+                            return True
+                        updated = {**self.is480_mode_state, 'pm_attempted': True,
+                                   'peers': dict(bridge.peer_boots)}
+                        updated.pop('pm_required', None)
+                        _save_mode(self, updated)
+                        self.is480_mode_state.update(updated)
+                        self.is480_mode_state.pop('pm_required', None)
+                    self._is480_warning(None, 'pm_required')
+                    self._is480_warning(None, 'run_request')
                     self._is480_sync_run_button()
                     self.widget_result_check.label3.config(
                         text=event['verdict']+' - CÓ THỂ CHUYỂN RUN',
@@ -5883,8 +5960,11 @@ class Main_Application(tk.Tk):
             if c and c.state not in ('DONE','ABORTED'):
                 self._is480_fault('PLC START while previous cycle active')
                 return False
+            if not self.is480_bridge.workers_ready.is_set():
+                self.is480_bridge.warning('start_cycle', 'Chưa nhận Body: đang chờ PC2/PC3 sẵn sàng')
+                return False
             if self.ser is None or not getattr(self.ser,'is_open',False):
-                self._is480_fault('PLC 0x10: COM1 unavailable')
+                self.is480_bridge.warning('plc', 'PLC 0x10: COM1 chưa sẵn sàng')
                 return False
             self.gui_kqdocbarcode = False
             self.ui_queue.put({'type':'is480_reset_barcode'})
@@ -5894,6 +5974,7 @@ class Main_Application(tk.Tk):
                     n = self.ser.write(b'\x30')
                     if n is not None and n != 1:
                         raise IOError('Unable to write 0x30')
+                self.is480_bridge.warning('plc')
                 threading.Thread(target=self.check_barcode, daemon=True,
                                  name='IS480-PLC-BodyBarcode').start()
                 return True
@@ -5931,6 +6012,9 @@ class Main_Application(tk.Tk):
                     if active and active.state not in ('DONE','ABORTED','FAULT'):
                         _log(self,'PLC_DUP','duplicate 0x11 ignored')
                         continue
+                    if not bridge.workers_ready.is_set():
+                        bridge.warning('start_cycle', 'Chưa bắt đầu VT1: đang chờ PC2/PC3 sẵn sàng')
+                        continue
                     if not self.gui_kqdocbarcode or not str(self.databacode or '').strip():
                         self._is480_fault('PLC 0x11: barcode missing/not acknowledged')
                         continue
@@ -5957,6 +6041,9 @@ class Main_Application(tk.Tk):
                     if self.is480_rfid_gate_active.is_set():
                         _log(self,'PLC_BLOCK','0x41 bị chặn: WAIT CARD')
                         continue
+                    if not bridge.workers_ready.is_set():
+                        bridge.warning('start_cycle', 'Chưa đọc lại Body: đang chờ PC2/PC3 sẵn sàng')
+                        continue
                     if not self.is480_body_scan_active.is_set():
                         from ReadBarcode import ScanHome
                         self.initProcess=ScanHome('COM3')
@@ -5969,23 +6056,27 @@ class Main_Application(tk.Tk):
                 self._is480_fault('PLC communication error: '+str(exc))
                 time.sleep(0.3)
 
-    def _is480_begin_cycle(self,barcode):
-        bridge=self.is480_bridge
-        try:
-            # gate = getattr(self,'is480_rfid_gate_active',None)
-            # if gate is not None and gate.is_set():
-            #     raise RuntimeError('Đang chờ xác nhận RFID/0x37 hoặc DB chưa chốt; không bắt đầu BODY mới')
-            cid=bridge.begin_master(barcode,'PM' if self.PM else 'RUN')
-            if not self.PM:
-                from is480_statistics import create_inspection_check
-                check_no=create_inspection_check(barcode)
-            else:check_no=0
-            bridge.machine.cycle.check_no=check_no
-            self.current_barcode=barcode
-            self.current_check_no=check_no
-            self.ui_queue.put({'type':'is480_start','cycle_id':cid,'barcode':barcode})
-        except Exception as exc:
-            self._is480_fault('START_CYCLE: '+str(exc))
+    def _is480_begin_cycle(self, barcode):
+        bridge = self.is480_bridge
+        with bridge.mode_lock:
+            if self.is480_rfid_gate_active.is_set():
+                return
+            try:
+                cid = bridge.begin_master(barcode, 'PM' if self.PM else 'RUN')
+                if not self.PM:
+                    check_no = create_inspection_check(barcode)
+                else:
+                    check_no = 0
+                bridge.machine.cycle.check_no = check_no
+                self.current_barcode = barcode
+                self.current_check_no = check_no
+                self.ui_queue.put({'type': 'is480_start', 'cycle_id': cid, 'barcode': barcode})
+            except Exception as exc:
+                reason = 'START_CYCLE: ' + str(exc)
+                if bridge.machine.cycle and bridge.machine.cycle.state not in ('DONE', 'ABORTED'):
+                    bridge.fault(reason)
+                else:
+                    bridge.warning('start_cycle', reason)
 
     def _is480_begin_vt2(self):
         try:

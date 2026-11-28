@@ -665,7 +665,8 @@ class Bridge:
                     return
                 self._final_sent.add(cid)
             c.verdict = result
-        self._repeat_serial(0x35 if result in ('OK', 'PM_OK') else 0x36,
+        # PLC accepts completion of PM regardless of the inspection verdict.
+        self._repeat_serial(0x35 if c.mode == 'PM' or result == 'OK' else 0x36,
                             'FINAL', cid)
 
     def final_done(self, pc, verdict, cid):

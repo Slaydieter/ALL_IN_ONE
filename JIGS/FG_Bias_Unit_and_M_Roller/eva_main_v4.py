@@ -16,7 +16,7 @@ import time
 import tkinter as tk
 import traceback
 import unicodedata
-from concurrent.futures import ThreadPoolExecutor, TimeoutError as FuturesTimeoutError
+from concurrent.futures import ThreadPoolExecutor, TimeoutError as FuturesTimeoutError, as_completed
 from datetime import datetime, time as dt_time, timedelta
 from pathlib import Path
 from queue import Empty
@@ -59,10 +59,12 @@ class SystemConfig:
     AUTO_BARCODE_RUN = False
     AUTO_BARCODE_PM = True
     BARCODE_TIMEOUT_SECONDS = 5.0
-    BARCODE_CAMERA = {
-        "camera": "cam6", "cam8"
-        "roi": (460, 110, 1063, 455),
-    }
+    # Thứ tự camera tương ứng với BODY NO1, BODY NO2, ...
+    # ROI là (x1, y1, x2, y2). None dùng toàn bộ khung hình.
+    BARCODE_CAMERAS = (
+        ("cam6", (980, 390, 1310, 580)),
+        ("cam8", (730, 435, 1065, 625)),
+    )
 
     AI_DEVICE = 0
 
@@ -1219,8 +1221,11 @@ class StationInfor(tk.Frame):
         super().__init__(parent, bd=2, relief="groove")
         self.pm_mode = pm_mode
         self.grid(sticky="nsew")
-        for i, mw in enumerate([120, 100, 100, 100, 120, 120, 120]):
-            self.columnconfigure(i, minsize=mw, weight=1)
+        body_count = max(1, len(SystemConfig.BARCODE_CAMERAS))
+        checkpoint_col = 2 + body_count
+        column_widths = [120, 100] + [120] * body_count + [140, 120, 120, 120]
+        for i, width in enumerate(column_widths):
+            self.columnconfigure(i, minsize=width, weight=1)
         self.rowconfigure(0, minsize=50, weight=1)
         self.rowconfigure(1, minsize=50, weight=1)
 
@@ -1232,24 +1237,34 @@ class StationInfor(tk.Frame):
         widgets = [
             ("label_1", "Unit:", 0, 0, "orange", 20, False),
             ("label_4", f"{md}", 1, 0, "black", 20, True),
-            ("label_2", "Body No:", 2, 0, "orange", 17, False),
-            ("label_5", "-", 3, 0, "black", 20, False),
             ("label_3", "Time:", 0, 1, "orange", 20, False),
             ("label_6", "0,00 s", 1, 1, "black", 20, False),
-            ("label_20", "Checkpoint:", 2, 1, "orange", 20, False),
-            ("label_7", "0", 3, 1, "black", 20, False),
-            ("label_8", "Q'ty OK", 4, 0, "orange", 20, False),
-            ("label_11", "0", 4, 1, "green", 20, False),
-            ("label_9", "Q'ty NG", 5, 0, "red", 20, False),
-            ("label_12", "0", 5, 1, "red", 20, False),
-            ("label_10", "Total", 6, 0, "orange", 20, False),
-            ("label_13", "0", 6, 1, "blue", 20, False),
+            ("label_20", "CHECKPOINT", checkpoint_col, 0, "orange", 17, False),
+            ("label_7", "0", checkpoint_col, 1, "black", 20, False),
+            ("label_8", "Q'ty OK", checkpoint_col + 1, 0, "orange", 20, False),
+            ("label_11", "0", checkpoint_col + 1, 1, "green", 20, False),
+            ("label_9", "Q'ty NG", checkpoint_col + 2, 0, "red", 20, False),
+            ("label_12", "0", checkpoint_col + 2, 1, "red", 20, False),
+            ("label_10", "Total", checkpoint_col + 3, 0, "orange", 20, False),
+            ("label_13", "0", checkpoint_col + 3, 1, "blue", 20, False),
         ]
         for attr, txt, col, row, fg, fs, bold in widgets:
             font = ("Arial", fs, "bold") if bold else ("Arial", fs)
             lbl = tk.Label(self, text=txt, font=font, fg=fg)
             lbl.grid(column=col, row=row, sticky=tk.NSEW)
             setattr(self, attr, lbl)
+        self.body_no_labels = []
+        for index in range(body_count):
+            heading = tk.Label(self, text=f"BODY NO{index + 1}", font=("Arial", 17), fg="orange")
+            heading.grid(column=2 + index, row=0, sticky=tk.NSEW)
+            value = tk.Label(self, text="-", font=("Arial", 20))
+            value.grid(column=2 + index, row=1, sticky=tk.NSEW)
+            self.body_no_labels.append(value)
+
+    def show_body_numbers(self, body_numbers):
+        for index, label in enumerate(self.body_no_labels):
+            code = body_numbers[index] if index < len(body_numbers) else None
+            label.config(text=code or "-", fg="blue" if code else "black")
 
 
 class DynamicButtonFrame(tk.Frame):
@@ -1546,6 +1561,7 @@ class MainApplication(tk.Tk):
 
         # Executors
         self.executor_capture = ThreadPoolExecutor(max_workers=SystemConfig.EXECUTOR_CAPTURE_WORKERS)
+        self.executor_barcode = ThreadPoolExecutor(max_workers=max(1, len(SystemConfig.BARCODE_CAMERAS)))
         self.executor = ThreadPoolExecutor(max_workers=SystemConfig.EXECUTOR_WORKERS)
         self.executor_ai = ThreadPoolExecutor(max_workers=SystemConfig.AI_MAX_CONCURRENT_WORKERS)
         self.executor_save = ThreadPoolExecutor(max_workers=SystemConfig.EXECUTOR_WORKERS)
@@ -1722,7 +1738,10 @@ class MainApplication(tk.Tk):
             pass
 
     def _lazy_init_cameras_for_recipe(self):
-        needed = self.recipe.get_needed_cam_ids()
+        needed = set(self.recipe.get_needed_cam_ids())
+        if not SystemConfig.should_skip_barcode(self.recipe.current_model_display):
+            needed.update(int(CameraKey.cam_token(camera))
+                          for camera, _ in SystemConfig.BARCODE_CAMERAS)
         with self.camera_state_lock:
             self.camera_generation += 1
             generation = self.camera_generation
@@ -2840,18 +2859,48 @@ class MainApplication(tk.Tk):
             self._save_barcode_counter()
         return f"{model}_{now:%y%m%d_%H%M}_{seq:04d}"
 
-    def read_cycle_barcode(self, received_at, cycle_id):
-        """Đọc mỗi frame mới tối đa một lần trong cửa sổ 5 giây từ D1."""
+    def read_cycle_barcodes(self, received_at, cycle_id):
+        """Đọc các camera song song, cùng dùng thời hạn tính từ D1."""
+        cameras = SystemConfig.BARCODE_CAMERAS
+        if not cameras:
+            raise ValueError("Chưa cấu hình camera đọc barcode trong BARCODE_CAMERAS")
+        for camera, _ in cameras:
+            if camera not in SystemConfig.CAMERA_LOCATION_REFS:
+                raise ValueError(f"Barcode camera {camera!r} is not configured in CAMERA_LOCATION_REFS")
+
+        deadline = received_at + SystemConfig.BARCODE_TIMEOUT_SECONDS
+        barcodes = [None] * len(cameras)
+        futures = {}
+        try:
+            for index, (camera, roi) in enumerate(cameras):
+                cam = int(CameraKey.cam_token(camera))
+                future = self.executor_barcode.submit(
+                    self._read_camera_barcode, cam, roi, received_at, deadline, cycle_id)
+                futures[future] = index
+
+            completed = as_completed(futures, timeout=max(0, deadline - time.monotonic()))
+            while True:
+                try:
+                    future = next(completed)
+                except (StopIteration, FuturesTimeoutError):
+                    break
+                code = future.result()
+                if code is not None:
+                    with self.plc_lock:
+                        if self.cycle_id != cycle_id or self.plc_cycle_aborted or not self.camera_running:
+                            break
+                        barcodes[futures[future]] = code
+                        self.ui_queue.put({"type": "barcode_progress", "body_numbers": tuple(barcodes)})
+        finally:
+            for future in futures:
+                future.cancel()
+        return barcodes
+
+    def _read_camera_barcode(self, cam, roi, received_at, deadline, cycle_id):
+        """Chỉ giải mã các frame mới của một camera trong cửa sổ đọc."""
         from barcode_reader import read_barcode
 
-        camera = SystemConfig.BARCODE_CAMERA["camera"]
-        roi = SystemConfig.BARCODE_CAMERA["roi"]
-        if camera not in SystemConfig.CAMERA_LOCATION_REFS:
-            raise ValueError(f"Barcode camera {camera!r} is not configured in CAMERA_LOCATION_REFS")
-        cam = int(CameraKey.cam_token(camera))
-        deadline = received_at + SystemConfig.BARCODE_TIMEOUT_SECONDS
         last_read_started = received_at
-
         while True:
             with self.frame_condition:
                 while (self.camera_running and not self.plc_cycle_aborted
@@ -2868,8 +2917,13 @@ class MainApplication(tk.Tk):
                 else:
                     return None
 
-            barcode = read_barcode(frame, roi=roi)
-            if barcode is not None and time.monotonic() <= deadline:
+            if roi is None:
+                height, width = frame.shape[:2]
+                frame_roi = (0, 0, width, height)
+            else:
+                frame_roi = roi
+            barcode = read_barcode(frame, roi=frame_roi)
+            if isinstance(barcode, str) and barcode.strip() and time.monotonic() <= deadline:
                 return barcode
 
     def handle_plc_d1_trigger(self, received_at=None):
@@ -2925,6 +2979,7 @@ class MainApplication(tk.Tk):
                 if step in self.plc_steps_captured or step in self.plc_step_in_progress:
                     return
                 self.plc_step_in_progress.add(step)
+                self.ui_queue.put({"type": "reset_cycle_display", "total": self.total_points})
             else:
                 if self.plc_next_step_index >= len(steps):
                     print("WARN: Ignoring D1 trigger; the current cycle is finishing")
@@ -2944,29 +2999,32 @@ class MainApplication(tk.Tk):
             return
 
         try:
-            barcode = None
             scan_barcode = start_new and not SystemConfig.should_skip_barcode(self.recipe.current_model_display)
-            if scan_barcode:
-                barcode = self.read_cycle_barcode(received_at, cycle_id)
+            barcodes = self.read_cycle_barcodes(received_at, cycle_id) if scan_barcode else []
 
             with self.plc_lock:
                 if self.cycle_id != cycle_id or self.plc_cycle_aborted or not self.camera_running:
                     return
                 if start_new:
-                    if barcode is None:
-                        if scan_barcode:
-                            camera = SystemConfig.BARCODE_CAMERA["camera"]
-                            cam = int(CameraKey.cam_token(camera))
-                            reason = (f"Không đọc được barcode từ {camera} trong "
-                                      f"{SystemConfig.BARCODE_TIMEOUT_SECONDS:g}s "
-                                      f"(ROI={SystemConfig.BARCODE_CAMERA['roi']}, "
-                                      f"camera_error={self.camera_last_error[cam]!r})")
-                            auto_barcode = SystemConfig.AUTO_BARCODE_PM if pm_mode else SystemConfig.AUTO_BARCODE_RUN
-                            if not auto_barcode:
-                                raise BarcodeTimeoutError(reason)
-                            MAIN_LOG.warning("%s. Tự sinh mã cycle.", reason)
-                        barcode = self.generate_cycle_barcode()
-                    if not self.prepare_network_cycle(barcode, pm_mode=pm_mode,
+                    if scan_barcode and None in barcodes:
+                        configured_reads = zip(SystemConfig.BARCODE_CAMERAS, barcodes)
+                        missing = ", ".join(
+                            f"BODY NO{index} ({camera}, ROI={roi}, "
+                            f"camera_error={self.camera_last_error[int(CameraKey.cam_token(camera))]!r})"
+                            for index, ((camera, roi), code) in enumerate(configured_reads, 1)
+                            if code is None
+                        )
+                        reason = (f"Không đọc được barcode trong "
+                                  f"{SystemConfig.BARCODE_TIMEOUT_SECONDS:g}s: {missing}")
+                        auto_barcode = SystemConfig.AUTO_BARCODE_PM if pm_mode else SystemConfig.AUTO_BARCODE_RUN
+                        if not auto_barcode:
+                            raise BarcodeTimeoutError(reason)
+                        MAIN_LOG.warning("%s. Tự sinh mã cho vị trí thiếu.", reason)
+                    if not scan_barcode:
+                        barcodes = [self.generate_cycle_barcode()]
+                    body_numbers = tuple(code if code is not None else self.generate_cycle_barcode()
+                                         for code in barcodes)
+                    if not self.prepare_network_cycle(body_numbers, pm_mode=pm_mode,
                                                       steps_snapshot=steps_snapshot):
                         self.write_plc_result(SystemConfig.PLC_RESULT_NG)
                         return
@@ -3671,6 +3729,8 @@ class MainApplication(tk.Tk):
             "result_step": self._h_result_step,
             "ng_grid": self._h_ng_grid,
             "START CHECK": self._h_start_check,
+            "barcode_progress": lambda d: self.widget_station_infor.show_body_numbers(d["body_numbers"]),
+            "reset_cycle_display": self._h_reset_cycle_display,
             "start_timer": lambda d: self._start_timer_ui(),
             "stop_cycle": self._h_stop_cycle,
             "statistics_refresh_summary": self._h_stats_refresh,
@@ -3730,11 +3790,15 @@ class MainApplication(tk.Tk):
         self.widget_result_check.label_image_1.show_frame(d["frame"], roi_views=d["roi_views"])
         self.last_display_mode = "ng_grid"
 
+    def _h_reset_cycle_display(self, d):
+        self.widget_station_infor.show_body_numbers(())
+        self.widget_station_infor.label_7.config(text=f'0/{d["total"]}', fg="black")
+
     def _h_start_check(self, d):
         self.clear_body_history_selection()
         self.widget_result_check.label_image_1.show_text(text="BẮT ĐẦU KIỂM TRA")
         self.widget_result_check.label2.configure(text="---", bg="blue")
-        self.widget_station_infor.label_5.config(text=d.get("data", ""), fg="blue")
+        self.widget_station_infor.show_body_numbers(d["body_numbers"])
         self.doimau()
         self.widget_result_check.listNGbox.delete(0, tk.END)
 
@@ -3863,11 +3927,13 @@ class MainApplication(tk.Tk):
                          ext="png", barcode=b)
 
     # ================= CYCLE INIT =================
-    def prepare_network_cycle(self, code, pm_mode=False, steps_snapshot=None):
-        if not isinstance(code, str) or not code.strip():
+    def prepare_network_cycle(self, body_numbers, pm_mode=False, steps_snapshot=None):
+        if not body_numbers or any(not isinstance(code, str) or not code.strip() for code in body_numbers):
             raise ValueError(
-                f"Body No không hợp lệ: barcode={code!r}, recipe={self.recipe.current_model_display!r}, "
+                f"Body No không hợp lệ: barcode={body_numbers!r}, recipe={self.recipe.current_model_display!r}, "
                 f"PM={pm_mode}, cycle={self.cycle_id}")
+        # Lưu các Body No theo thứ tự camera trong trường barcode hiện có.
+        code = " | ".join(body_numbers)
         steps_snapshot = dict(steps_snapshot or self.recipe.plc_steps)
         expected = self._build_expected_points(steps_snapshot)
         if not expected:
@@ -3926,7 +3992,7 @@ class MainApplication(tk.Tk):
                 self.queue_xl_anh.get_nowait()
             except Exception:
                 pass
-        self.ui_queue.put({"type": "START CHECK", "data": code})
+        self.ui_queue.put({"type": "START CHECK", "body_numbers": body_numbers})
         print(f"CYCLE: recipe={self.cycle_recipe_name}, PM={pm_mode}, "
               f"steps={len(steps_snapshot)}, points={len(self.cycle_expected_points)}, barcode={code!r}")
         return True
@@ -4408,7 +4474,7 @@ class MainApplication(tk.Tk):
                 print(f"WARN: Save tasks did not finish within {SystemConfig.SAVE_EXECUTOR_SHUTDOWN_TIMEOUT}s")
         except Exception as e:
             print(f"WARN: Save shutdown failed: {e}")
-        for ex in (self.executor_capture, self.executor, self.executor_ai):
+        for ex in (self.executor_capture, self.executor_barcode, self.executor, self.executor_ai):
             try:
                 ex.shutdown(wait=False)
             except Exception:

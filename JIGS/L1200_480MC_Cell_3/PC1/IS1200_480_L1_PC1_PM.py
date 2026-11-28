@@ -868,6 +868,20 @@ def load_site_config(path, pc_id):
 
 # Application helpers
 
+_IS480_VIEW_GROUPS = {
+    'PC2': (('CAM12_VT1','CAM13_VT1','CAM14_VT1','CAM15_VT1',
+             'CAM16_VT1','CAM17_VT1','CAM18_VT1'),
+            ('CAM14_VT2','CAM15_VT2','CAM17_VT2','CAM18_VT2','CAM19_VT2')),
+    'PC3': (('CAM21_VT1','CAM22_VT1','CAM23_VT1'),
+            ('CAM8_VT2','CAM9_VT2','CAM10_VT2','CAM11_VT2',
+             'CAM20_VT2','CAM21_VT2','CAM22_VT2','CAM23_VT2')),
+}
+_IS480_PM_HIDDEN = {
+    'PC2': {'CAM18_VT1','CAM14_VT2','CAM15_VT2','CAM17_VT2'},
+    'PC3': {'CAM21_VT1','CAM22_VT1','CAM23_VT2'},
+}
+
+
 def _log(app, event, message):
     try:
         p = Path(__file__).resolve().with_name('is480_operation.log')
@@ -3971,10 +3985,7 @@ class Main_Application(tk.Tk):
                 elif data["type"] == "ng_point":
                     self.widget_result_check.listNGbox.insert(tk.END, data["text"])
                 elif data["type"] == "button_ng":
-                    # ✅ FIX: đổi màu button từ main thread (thread-safe với Tkinter)
-                    widget = getattr(self.widget_buttom, data["attr"], None)
-                    if widget:
-                        self.widget_buttom.set_cam_button_color(widget, 'violet', 'red')
+                    self._is480_mark_camera_ng(data)
                 elif data["type"] == "final_result":
                     # PC1 local result is NOT the 3-PC production verdict.
                     # Show final OK/NG only after the PLC's 0x15 ACK arrives.
@@ -4121,7 +4132,8 @@ class Main_Application(tk.Tk):
             color = (0, 0, 255)
             # ✅ FIX: đổi màu button qua ui_queue thay vì gọi trực tiếp từ worker thread
             attr_name = f"CAM{cam}_VT{vitri}"
-            self.ui_queue.put({"type": "button_ng", "attr": attr_name})
+            self.ui_queue.put({"type": "button_ng", "attr": attr_name,
+                               "cycle_id": self._is480_tls.cid})
             self._is480_ng_point(cam, vitri, point)
             self.list_ng.append(crop_image)
             label = f'D{point["POINT"]}_CAM{cam}'
@@ -4316,18 +4328,9 @@ class Main_Application(tk.Tk):
 
     def doimau(self):
         self.widget_buttom._clear_cam_button_highlight()
-        if self.PM:
-            cam_vt_list = [(0, 1), (1, 1), (2, 1), (3, 1), (3, 2), (4, 1), (5, 1), (6, 1), (7, 1),
-                           (0, 2), (1, 2), (2, 2), (5, 2)]
-        else:
-            cam_vt_list = [(0, 1), (1, 1), (2, 1), (3, 1), (3, 2), (4, 1), (5, 1), (6, 1), (7, 1),
-                           (0, 2), (1, 2), (2, 2), (5, 2)]
-
-        for cam, vt in cam_vt_list:
-            attr_name = f"CAM{cam}_VT{vt}"
-            widget = getattr(self.widget_buttom, attr_name, None)
-            if widget:
-                self.widget_buttom.set_cam_button_color(widget, 'green', 'yellow')
+        for slot in self.is480_cam_slots:
+            slot.update(bg='green', fg='yellow')
+        self._is480_refresh_cam_button_colors()
 
     # def check_barcode(self):
     #     print('🔍 Vào đọc barcode')
@@ -4504,6 +4507,7 @@ class Main_Application(tk.Tk):
         self._is480_vt_started = {}
         self.is480_ng_point_details = []
         self.is480_selected_pc = 'PC1'
+        self.is480_remote_camera = None
         self.is480_remote_images = {}
         self.is480_view_lock = threading.RLock()
         self.is480_checked_jpegs = {}  # latest cycle; JPEG thumbnails only
@@ -4728,13 +4732,11 @@ class Main_Application(tk.Tk):
         old=self.is480_selected_pc
         if old=='PC1' and pc!='PC1':
             self.is480_pc1_last_img=getattr(self,'last_display_imgtk',None)
-            for slot in self.is480_cam_slots:
-                button=slot['button']
-                slot['bg'],slot['fg']=button.cget('bg'),button.cget('fg')
         # Clear any previous native camera highlight before reusing buttons.
         clear=getattr(bottom,'_clear_cam_button_highlight',None)
         if callable(clear):clear()
         self.is480_selected_pc=pc
+        self.is480_remote_camera = None
         if pc=='PC1':
             for slot in self.is480_cam_slots:
                 button=slot['button']
@@ -4785,7 +4787,9 @@ class Main_Application(tk.Tk):
             self.is480_run_btn.grid(row=2,column=6,sticky='nsew',padx=3,pady=3)
             self.is480_abort_btn.grid(row=2,column=7,sticky='nsew',padx=3,pady=3)
         self._is480_refresh_cam_button_colors()
-        first=next((label for b,label in visible if (pc,label) in self.is480_remote_view_jpegs),None)
+        first = next((label for _, label in visible
+                      if (pc, label) in self.is480_remote_view_jpegs
+                      or (pc, label) in self.is480_remote_ng_paths), None)
         if first:self._is480_show_checked_camera(pc,first)
         else:self.widget_result_check.label_image_1.configure(
             image='',text=pc+': CHƯA CÓ ẢNH ĐÃ CHECK')
@@ -5081,13 +5085,14 @@ class Main_Application(tk.Tk):
         self.is480_raw_jpegs={}
         with self.is480_view_lock:
             self.is480_checked_jpegs.clear()
-            if self.is480_pc_id=='PC1':self.is480_remote_view_jpegs.clear()
-        if self.is480_pc_id=='PC1':
-            self.is480_remote_images.clear()  # legacy cache
-            self.is480_pc1_last_img = None
-            self.is480_remote_ng_paths.clear()
+            self.is480_remote_view_jpegs.clear()
             self.is480_remote_view_verdict.clear()
-            self.is480_remote_details_saved.clear()
+        self.is480_remote_images.clear()
+        self.is480_pc1_last_img = None
+        self.is480_remote_camera = None
+        self.is480_remote_ng_paths.clear()
+        self.is480_remote_details_saved.clear()
+        self.doimau()
         self._is480_vt_started={1:time.monotonic()}
         self.is480_ng_point_details=[]
         self.is480_final_cache=None
@@ -5141,7 +5146,7 @@ class Main_Application(tk.Tk):
         # This is ONLY a UI update; NG detail rows are written atomically by the
         # event server on NG_DETAILS, and only from genuine NG POINT metadata.
         if self.is480_selected_pc == pc:
-            self._is480_refresh_cam_button_colors()
+            self._is480_update_remote_view(pc, label)
         elif self.is480_selected_pc == 'PC1' and self.is480_final_cache in ('NG','PM_NG'):
             self._is480_render_global_ng()
 
@@ -5166,12 +5171,14 @@ class Main_Application(tk.Tk):
         c=self.is480_bridge.machine.cycle
         if not c or c.cid!=str(msg.get('cycle_id')) or pc not in ('PC2','PC3'):
             raise ValueError('cycle/PC không hợp lệ cho VIEW_IMAGE')
-        if not re.fullmatch(r'CAM\\d+_VT[12]',label):
+        if not re.fullmatch(r'CAM\d+_VT[12]',label):
             raise ValueError('VIEW_IMAGE camera không hợp lệ')
         blob=base64.b64decode(str(msg.get('image','')),validate=True)
-        if not (10<len(blob)<1_500_000 and blob.startswith(b'\\xff\\xd8') and blob.endswith(b'\\xff\\xd9')):
+        if not (10<len(blob)<1_500_000 and blob.startswith(b'\xff\xd8') and blob.endswith(b'\xff\xd9')):
             raise ValueError('VIEW_IMAGE JPEG không hợp lệ')
         with self.is480_view_lock:
+            if not self.is480_bridge.machine.current(c.cid):
+                raise ValueError('stale VIEW_IMAGE cycle')
             self.is480_remote_view_jpegs[(pc,label)]=blob
             self.is480_remote_view_verdict[(pc,label)]=bool(msg.get('is_ng'))
         return True
@@ -5221,39 +5228,65 @@ class Main_Application(tk.Tk):
         if pc=='PC1':
             with self.is480_view_lock:blob=self.is480_checked_jpegs.get(label)
         else:
-            with self.is480_view_lock:blob=self.is480_remote_view_jpegs.get((pc,label))
-        if not blob:
-            self.widget_result_check.label_image_1.configure(image='',text=pc+' '+label+': CHƯA CÓ ẢNH CHECK')
+            self.is480_remote_camera = label
+            with self.is480_view_lock:
+                blob = self.is480_remote_view_jpegs.get((pc, label))
+        if blob:
+            frame = cv2.imdecode(np.frombuffer(blob, dtype=np.uint8), cv2.IMREAD_COLOR)
+        elif filename := self.is480_remote_ng_paths.get((pc, label)):
+            frame = cv2.imread(filename, cv2.IMREAD_COLOR)
+        else:
+            self.widget_result_check.label_image_1.configure(
+                image='', text=f'{pc} {label}: CHƯA CÓ ẢNH CHECK')
             return False
-        frame=cv2.imdecode(np.frombuffer(blob,dtype=np.uint8),cv2.IMREAD_COLOR)
         if frame is None:
             self._is480_warning('JPEG xem ảnh lỗi: '+pc+' '+label)
             return False
         self._is480_show_frame(frame)
         return True
 
-    def _is480_view_image_event(self,event):
-        if self.is480_pc_id != 'PC1':return
-        pc=event.get('pc'); label=event.get('cam_vt')
+    def _is480_view_image_event(self, event):
+        cycle = self.is480_bridge.machine.cycle
+        if not cycle or cycle.cid != event.get('cycle_id') or cycle.state in ('FAULT', 'ABORTED'):
+            return
+        pc, label = event['pc'], event['cam_vt']
         if self.is480_selected_pc == pc:
-            self._is480_refresh_cam_button_colors()
-        _log(self,'VIEW_RECEIVED',pc+' '+str(label))
+            self._is480_update_remote_view(pc, label)
+        _log(self, 'VIEW_RECEIVED', f'{pc} {label}')
+
+    def _is480_update_remote_view(self, pc, label):
+        self._is480_refresh_cam_button_colors()
+        if self.is480_remote_camera in (None, label):
+            if any(label == visible for _, visible in self.is480_visible_cam_slots):
+                self._is480_show_checked_camera(pc, label)
+
+    def _is480_mark_camera_ng(self, event):
+        cycle = self.is480_bridge.machine.cycle
+        if not cycle or cycle.cid != event.get('cycle_id') or cycle.state in ('FAULT', 'ABORTED'):
+            return
+        for slot in self.is480_cam_slots:
+            if slot['label'] == event['attr']:
+                slot.update(bg='#BC2626', fg='white')
+                if self.is480_selected_pc == 'PC1':
+                    self.widget_buttom.set_cam_button_color(slot['button'], slot['bg'], slot['fg'])
+                break
 
     def _is480_refresh_cam_button_colors(self):
-        if self.is480_pc_id!='PC1' or not hasattr(self,'is480_cam_slots'):return
-        pc=self.is480_selected_pc
-        ng_keys=set(getattr(self,'is480_remote_ng_paths',{}))
-        for button,label in getattr(self,'is480_visible_cam_slots',[]):
-            if pc=='PC1':continue
-            if (pc,label) in ng_keys or self.is480_remote_view_verdict.get((pc,label),False):
-                button.config(bg='#BC2626',fg='white')
-            elif (pc,label) in self.is480_remote_view_jpegs:
-                button.config(bg='#18803C',fg='white')
-            else:
-                button.config(bg='#4B5563',fg='white')
+        pc = self.is480_selected_pc
+        if pc == 'PC1':
+            for slot in self.is480_cam_slots:
+                self.widget_buttom.set_cam_button_color(slot['button'], slot['bg'], slot['fg'])
+            return
+
+        with self.is480_view_lock:
+            verdicts = dict(self.is480_remote_view_verdict)
+        for button, label in self.is480_visible_cam_slots:
+            key = (pc, label)
+            is_ng = key in self.is480_remote_ng_paths or verdicts.get(key, False)
+            button.config(bg='#BC2626' if is_ng else '#18803C', fg='white')
 
     def _is480_render_global_ng(self):
-        """Show all RUN NG PROC images of PC1,PC2,PC3 in a near-square grid."""
+        """Show available NG inspection images from PC1, PC2 and PC3."""
         if self.is480_pc_id!='PC1':return
         import cv2,numpy as np
         c=self.is480_bridge.machine.cycle
@@ -5273,6 +5306,18 @@ class Main_Application(tk.Tk):
                 if frame is not None:frames[pc+' '+label]=frame
             except OSError as exc:
                 self._is480_warning('Lỗi đọc JPEG NG '+str(exc))
+        with self.is480_view_lock:
+            remote_ng_previews = {
+                (pc, label): blob
+                for (pc, label), blob in self.is480_remote_view_jpegs.items()
+                if self.is480_remote_view_verdict.get((pc, label))
+            }
+        for (pc, label), blob in remote_ng_previews.items():
+            key = f'{pc} {label}'
+            if key not in frames:
+                frame = cv2.imdecode(np.frombuffer(blob, dtype=np.uint8), cv2.IMREAD_COLOR)
+                if frame is not None:
+                    frames[key] = frame
         self.is480_last_ng_count=len(frames)
         if not frames:
             self.widget_result_check.label_image_1.configure(
@@ -5479,8 +5524,9 @@ class Main_Application(tk.Tk):
         with self.is480_view_lock:
             self.is480_checked_jpegs.clear()
             self.is480_remote_view_jpegs.clear()
+            self.is480_remote_view_verdict.clear()
+        self.is480_remote_camera = None
         self.is480_remote_ng_paths.clear()
-        self.is480_remote_view_verdict.clear()
         self.is480_remote_details_saved.clear()
         self.is480_bridge._pending_local_final=None
         with self.allow_put_lock:self.allow_put=False
